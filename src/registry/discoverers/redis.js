@@ -239,24 +239,33 @@ class RedisDiscoverer extends BaseDiscoverer {
                 this.idx = 0;
 
                 return this.client.mgetBuffer(...scannedKeys)
-                  .then(packets => packets.map((raw, i) => {
-                    try {
-                      if (raw === null) {
-                        const removingKey = scannedKeys[i];
-                        this.client.srem(this.BEAT_KEYS, removingKey);
-                      } else {
-                        const p = scannedKeys[i].substring(`${this.PREFIX}-BEAT:`.length).split('|');
-                        return {
-                          sender: p[0],
-                          instanceID: p[1],
-                          seq: Number(p[2]),
-                          ...this.serializer.deserialize(raw, P.PACKET_INFO)
-                        };
+                  .then(packets => {
+                    const promiseSREM = [];
+                    const result = [];
+                    packets.forEach((raw, i) => {
+                      try {
+                        if (raw === null) {
+                          const removingKey = scannedKeys[i];
+                          promiseSREM.push(this.client.srem(this.BEAT_KEYS, removingKey));
+                        } else {
+                          const p = scannedKeys[i].substring(`${this.PREFIX}-BEAT:`.length).split('|');
+                          result.push({
+                            sender: p[0],
+                            instanceID: p[1],
+                            seq: Number(p[2]),
+                            ...this.serializer.deserialize(raw, P.PACKET_INFO)
+                          });
+                        }
+                      } catch (err) {
+                        this.logger.warn('Unable to parse HEARTBEAT packet', err, raw);
                       }
-                    } catch (err) {
-                      this.logger.warn('Unable to parse HEARTBEAT packet', err, raw);
-                    }
-                  }));
+                    });
+
+                    return this.Promise.all(promiseSREM)
+                      .then(() => {
+                        return result;
+                      });
+                  });
               } else {
                 // this.logger.debug("Lazy check", this.idx);
                 // Lazy check
