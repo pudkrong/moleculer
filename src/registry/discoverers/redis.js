@@ -41,6 +41,11 @@ class RedisDiscoverer extends BaseDiscoverer {
       monitor: false
     });
 
+    // We don't need because we run full check all the time
+    this.opts.disableHeartbeatChecks = true;
+    // We don't need because we run full check all the time
+    this.opts.disableOfflineNodeRemoving = true;
+
     // Loop counter for full checks. Starts from a random value for better distribution
     this.idx = this.opts.fullCheck > 1 ? _.random(this.opts.fullCheck - 1) : 0;
 
@@ -162,9 +167,9 @@ class RedisDiscoverer extends BaseDiscoverer {
 
     this.infoUpdateTimer = setTimeout(() => {
       // Reset the INFO packet expiry.
-      this.client.expire(this.INFO_KEY, 60 * 60); // 60 mins
+      this.client.expire(this.INFO_KEY, this.opts.heartbeatTimeout * 10); // 10x from heartbeat timeoout
       this.recreateInfoUpdateTimer();
-    }, 20 * 60 * 1000); // 20 mins
+    }, this.opts.heartbeatInterval * 1000 * 10); // 10x from heartbeat interval
     this.infoUpdateTimer.unref();
   }
 
@@ -173,8 +178,6 @@ class RedisDiscoverer extends BaseDiscoverer {
 	 */
   sendHeartbeat () {
     // console.log("REDIS - HB 1", localNode.id, this.heartbeatTimer);
-    if (this.client.status !== 'ready') return this.Promise.resolve();
-
     const timeEnd = this.broker.metrics.timer(METRIC.MOLECULER_DISCOVERER_REDIS_COLLECT_TIME);
     const data = {
       sender: this.broker.nodeID,
@@ -206,7 +209,7 @@ class RedisDiscoverer extends BaseDiscoverer {
         return pl.exec();
       })
       .then(() => this.lastBeatSeq = seq)
-      .then(() => this.collectOnlineNodes())
+      .then(() => this.fullCheckOnlineNodes())
       .catch(err => this.logger.error('Error occured while scanning Redis keys.', err))
       .then(() => {
         timeEnd();
@@ -214,90 +217,58 @@ class RedisDiscoverer extends BaseDiscoverer {
       });
   }
 
-  /**
-	 * Collect online nodes from Redis server.
-	 */
-  collectOnlineNodes () {
-    if (this.client.status !== 'ready') return this.Promise.resolve();
+  async fullCheckOnlineNodes () {
+    try {
+      const scannedKeys = await this.client.smembers(this.BEAT_KEYS);
+      // Just exit if there is no node
+      if (!scannedKeys.length) return;
 
-    // Get the current node list so that we can check the disconnected nodes.
-    const prevNodes = this.registry.nodes.list({ onlyAvailable: true, withServices: false })
-      .map(node => node.id)
-      .filter(nodeID => nodeID !== this.broker.nodeID);
+      const packets = await this.client.mgetBuffer(...scannedKeys);
+      const removedKeys = new Map();
+      const availKeys = new Set();
+      packets.forEach(async (raw, i) => {
+        const p = scannedKeys[i].substring(`${this.PREFIX}-BEAT:`.length).split('|');
+        if (raw !== null) {
+          const packet = {
+            sender: p[0],
+            instanceID: p[1],
+            seq: Number(p[2]),
+            ...this.serializer.deserialize(raw, P.PACKET_INFO)
+          };
 
-    // Collect the online node keys.
-    return new this.Promise((resolve, reject) => {
-      this.client.smembers(this.BEAT_KEYS)
-        .then((scannedKeys) => {
-          if (scannedKeys.length == 0) return resolve();
+          if (packet.sender !== this.broker.nodeID) {
+            availKeys.add(packet.sender);
+            await this.heartbeatReceived(packet.sender, packet);
+          }
+        } else {
+          // If key is expired, just remove
+          removedKeys.set(p[0], scannedKeys[i]);
+        }
+      });
 
-          this.Promise.resolve()
-            .then(() => {
-              if (this.opts.fullCheck && ++this.idx % this.opts.fullCheck == 0) {
-                // Full check
-                // this.logger.debug("Full check", this.idx);
-                this.idx = 0;
-
-                return this.client.mgetBuffer(...scannedKeys)
-                  .then(packets => {
-                    const promiseSREM = [];
-                    const result = [];
-                    packets.forEach((raw, i) => {
-                      try {
-                        if (raw === null) {
-                          const removingKey = scannedKeys[i];
-                          promiseSREM.push(this.client.srem(this.BEAT_KEYS, removingKey));
-                        } else {
-                          const p = scannedKeys[i].substring(`${this.PREFIX}-BEAT:`.length).split('|');
-                          result.push({
-                            sender: p[0],
-                            instanceID: p[1],
-                            seq: Number(p[2]),
-                            ...this.serializer.deserialize(raw, P.PACKET_INFO)
-                          });
-                        }
-                      } catch (err) {
-                        this.logger.warn('Unable to parse HEARTBEAT packet', err, raw);
-                      }
-                    });
-
-                    return this.Promise.all(promiseSREM)
-                      .then(() => {
-                        return result;
-                      });
-                  });
-              } else {
-                // this.logger.debug("Lazy check", this.idx);
-                // Lazy check
-                return scannedKeys.map(key => {
-                  const p = key.substring(`${this.PREFIX}-BEAT:`.length).split('|');
-                  return {
-                    sender: p[0],
-                    instanceID: p[1],
-                    seq: Number(p[2])
-                  };
-                });
-              }
-            })
-            .then(packets => {
-              packets.map(packet => {
-                if (packet.sender == this.broker.nodeID) return;
-
-                removeFromArray(prevNodes, packet.sender);
-                this.heartbeatReceived(packet.sender, packet);
-              });
-            })
-            .then(() => resolve());
-        });
-    }).then(() => {
-      if (prevNodes.length > 0) {
-        // Disconnected nodes
-        prevNodes.forEach(nodeID => {
-          this.logger.info(`The node '${nodeID}' is not available. Removing from registry...`);
-          this.remoteNodeDisconnected(nodeID, true);
+      // Remove expired HB from set and remove from registry
+      if (removedKeys.size) {
+        await this.client.srem(this.BEAT_KEYS, ...[...removedKeys.values()]);
+        removedKeys.forEach((v, k) => {
+          this.logger.warn(`Heartbeat is not received from '${k}' node.`);
+          this.registry.nodes.disconnected(k, true);
         });
       }
-    });
+
+      // Clean local registry
+      const prevNodes = this.registry.nodes.list({ onlyAvailable: false, withServices: false });
+      prevNodes.forEach(node => {
+        if ((node.id !== this.broker.nodeID) && !availKeys.has(node.id)) {
+          this.logger.warn(`Removing offline '${node.id}' node from registry because it hasn't submitted heartbeat signal.`);
+          this.registry.nodes.delete(node.id);
+        }
+      });
+    } catch (error) {
+      this.logger.warn(
+        'Unable to parse HEARTBEAT packet',
+        error
+      );
+    }
   }
 
   /**
@@ -325,7 +296,7 @@ class RedisDiscoverer extends BaseDiscoverer {
 	 * Discover all nodes (after connected)
 	 */
   discoverAllNodes () {
-    return this.collectOnlineNodes();
+    return this.fullCheckOnlineNodes();
   }
 
   /**
@@ -342,18 +313,18 @@ class RedisDiscoverer extends BaseDiscoverer {
 
     const key = this.INFO_KEY;
     const seq = this.localNode.seq;
+    // Set expires 10x from heartbeatTimeout;
+    const expires = this.opts.heartbeatTimeout * 10;
 
     const p = !nodeID && this.broker.options.disableBalancer ? this.transit.tx.makeBalancedSubscriptions() : this.Promise.resolve();
-    return p.then(() => this.client.setex(key, 30 * 60, this.serializer.serialize(payload, P.PACKET_INFO)))
+    return p.then(() => this.client.setex(key, expires, this.serializer.serialize(payload, P.PACKET_INFO)))
       .then(() => {
         this.lastInfoSeq = seq;
 
         this.recreateInfoUpdateTimer();
 
         // Sending a new heartbeat because it contains the `seq`
-        if (!nodeID) {
-          return this.beat();
-        }
+        if (!nodeID) return this.beat();
       })
       .catch(err => {
         this.logger.error('Unable to send INFO to Redis server', err);
@@ -368,38 +339,32 @@ class RedisDiscoverer extends BaseDiscoverer {
       .then(() => super.localNodeDisconnected())
       .then(() => this.logger.debug('Remove local node from registry...'))
       .then(() => this.client.del(this.INFO_KEY))
-      .then(() => this.scanClean(this.BEAT_KEY + '*'));
+      .then(() => this.scanClean(this.BEAT_KEY + '|'))
+      .catch((err) => {
+        this.logger.error(`Error occured while deleting Redis keys when local node is disconnected.`, err);
+      });
   }
 
   /**
 	 * Clean Redis key by pattern
 	 * @param {String} match
 	 */
-  scanClean (match) {
-    return new Promise((resolve, reject) => {
-      const stream = this.client.scanStream({
-        match,
-        count: this.opts.scanLength
-      });
-
-      stream.on('data', (keys = []) => {
-        if (!keys.length) {
-          return;
-        }
-
-        stream.pause();
-        return this.client.del(keys)
-          .then(() => stream.resume())
-          .catch((err) => reject(err));
-      });
-
-      stream.on('error', (err) => {
-        this.logger.error(`Error occured while deleting Redis keys '${match}'.`, err);
-        reject(err);
-      });
-
-      stream.on('end', () => resolve());
+  async scanClean (prefix) {
+    const scannedKeys = await this.client.smembers(this.BEAT_KEYS);
+    const removingKeys = [];
+    scannedKeys.forEach((key) => {
+      if (key.startsWith(prefix)) {
+        removingKeys.push(key);
+      }
     });
+
+    return (removingKeys.length) ?
+      this.client
+        .multi()
+        .srem(this.BEAT_KEYS, ...removingKeys)
+        .del(...removingKeys)
+        .exec()
+      : null;
   }
 }
 
