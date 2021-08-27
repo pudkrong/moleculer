@@ -260,7 +260,7 @@ class RedisDiscoverer extends BaseDiscoverer {
       prevNodes.forEach(node => {
         if ((node.id !== this.broker.nodeID) && !availKeys.has(node.id)) {
           this.logger.warn(`Removing offline '${node.id}' node from registry because it hasn't submitted heartbeat signal.`);
-          this.registry.nodes.delete(node.id);
+          this.registry.nodes.disconnected(node.id, true);
         }
       });
     } catch (error) {
