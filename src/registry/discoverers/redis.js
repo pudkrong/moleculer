@@ -79,7 +79,7 @@ class RedisDiscoverer extends BaseDiscoverer {
       this.broker.fatal("The 'ioredis' package is missing. Please install it with 'npm install ioredis --save' command.", err, true);
     }
 
-    this.logger.warn(kleur.yellow().bold('Redis Discoverer is an EXPERIMENTAL module. Do NOT use it in production!'));
+    // this.logger.warn(kleur.yellow().bold('Redis Discoverer is an EXPERIMENTAL module. Do NOT use it in production!'));
 
     // Using shorter instanceID to reduce the network traffic
     this.instanceHash = this.broker.instanceID.substring(0, 8);
