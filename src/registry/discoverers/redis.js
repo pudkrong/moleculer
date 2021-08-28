@@ -41,11 +41,6 @@ class RedisDiscoverer extends BaseDiscoverer {
       monitor: false
     });
 
-    // We don't need because we run full check all the time
-    this.opts.disableHeartbeatChecks = true;
-    // We don't need because we run full check all the time
-    this.opts.disableOfflineNodeRemoving = true;
-
     // Loop counter for full checks. Starts from a random value for better distribution
     this.idx = this.opts.fullCheck > 1 ? _.random(this.opts.fullCheck - 1) : 0;
 
@@ -151,6 +146,35 @@ class RedisDiscoverer extends BaseDiscoverer {
       });
   }
 
+  startHeartbeatTimers() {
+		this.stopHeartbeatTimers();
+
+		if (this.opts.heartbeatInterval > 0) {
+			// HB timer
+			this._heartbeatInterval = this.opts.heartbeatInterval * 1000 + (Math.round(Math.random() * 1000) - 500); // random +/- 500ms
+      this._startHeartbeatTimers();
+		}
+	}
+
+  _startHeartbeatTimers () {
+		if (this.heartbeatTimer) clearTimeout(this.heartbeatTimer);
+
+    this.heartbeatTimer = setTimeout(async () => {
+      await this.localNode.updateLocalInfo(this.broker.getCpuUsage);
+      await this.sendHeartbeat();
+
+      this._startHeartbeatTimers();
+    }, this._heartbeatInterval);
+    this.heartbeatTimer.unref();
+  }
+
+	stopHeartbeatTimers() {
+		if (this.heartbeatTimer) {
+			clearTimeout(this.heartbeatTimer);
+			this.heartbeatTimer = null;
+		}
+	}
+
   /**
 	 * Register Moleculer Transit Core metrics.
 	 */
@@ -177,44 +201,45 @@ class RedisDiscoverer extends BaseDiscoverer {
 	 * Sending a local heartbeat to Redis.
 	 */
   async sendHeartbeat () {
-    // console.log("REDIS - HB 1", localNode.id, this.heartbeatTimer);
     const timeEnd = this.broker.metrics.timer(METRIC.MOLECULER_DISCOVERER_REDIS_COLLECT_TIME);
-    const data = {
-      sender: this.broker.nodeID,
-      ver: this.broker.PROTOCOL_VERSION,
 
-      // timestamp: Date.now(),
-      cpu: this.localNode.cpu,
-      seq: this.localNode.seq,
-      instanceID: this.broker.instanceID
-    };
+    try {
+      const data = {
+        sender: this.broker.nodeID,
+        ver: this.broker.PROTOCOL_VERSION,
 
-    const seq = this.localNode.seq;
-    const key = this.BEAT_KEY + '|' + seq;
+        // timestamp: Date.now(),
+        cpu: this.localNode.cpu,
+        seq: this.localNode.seq,
+        instanceID: this.broker.instanceID
+      };
 
-    let pl = this.client.multi();
+      const seq = this.localNode.seq;
+      const key = this.BEAT_KEY + '|' + seq;
 
-    if (seq != this.lastBeatSeq) {
-      // Remove previous BEAT keys
-      pl = pl.del(this.BEAT_KEY + '|' + this.lastBeatSeq);
-      pl = pl.srem(this.BEAT_KEYS, this.BEAT_KEY + '|' + this.lastBeatSeq);
+      let pl = this.client.multi();
+
+      if (seq != this.lastBeatSeq) {
+        // Remove previous BEAT keys
+        pl = pl.del(this.BEAT_KEY + '|' + this.lastBeatSeq);
+        pl = pl.srem(this.BEAT_KEYS, this.BEAT_KEY + '|' + this.lastBeatSeq);
+      }
+
+      // Create new HB key
+      pl = pl.setex(key, this.opts.heartbeatTimeout, this.serializer.serialize(data, P.PACKET_HEARTBEAT));
+      pl = pl.sadd(this.BEAT_KEYS, key);
+
+      await pl.exec();
+
+      this.lastBeatSeq = seq;
+
+      await this.fullCheckOnlineNodes();
+    } catch (error) {
+      this.logger.error('Error occured while sendHeartbeat', error);
+    } finally {
+      timeEnd();
+      this.broker.metrics.increment(METRIC.MOLECULER_DISCOVERER_REDIS_COLLECT_TOTAL);
     }
-
-    // Create new HB key
-    pl = pl.setex(key, this.opts.heartbeatTimeout, this.serializer.serialize(data, P.PACKET_HEARTBEAT));
-    pl = pl.sadd(this.BEAT_KEYS, key);
-
-    await pl.exec();
-
-    this.lastBeatSeq = seq;
-
-    await this.fullCheckOnlineNodes()
-      .catch(err => {
-        this.logger.error('Error occured while scanning Redis keys.', err);
-      });
-
-    timeEnd();
-    this.broker.metrics.increment(METRIC.MOLECULER_DISCOVERER_REDIS_COLLECT_TOTAL);
   }
 
   async fullCheckOnlineNodes () {
