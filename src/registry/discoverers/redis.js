@@ -247,6 +247,10 @@ class RedisDiscoverer extends BaseDiscoverer {
       });
 
       // Remove expired HB from set and remove from registry
+      // We have to check again with available nodes because each node might have more than 1 beat (many seq)
+      removedKeys.forEach((v, k) => {
+        if (availKeys.has(k)) removedKeys.delete(k);
+      });
       if (removedKeys.size) {
         await this.client.srem(this.BEAT_KEYS, ...[...removedKeys.values()]);
         removedKeys.forEach((v, k) => {
