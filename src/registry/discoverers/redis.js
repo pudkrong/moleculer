@@ -176,7 +176,7 @@ class RedisDiscoverer extends BaseDiscoverer {
   /**
 	 * Sending a local heartbeat to Redis.
 	 */
-  sendHeartbeat () {
+  async sendHeartbeat () {
     // console.log("REDIS - HB 1", localNode.id, this.heartbeatTimer);
     const timeEnd = this.broker.metrics.timer(METRIC.MOLECULER_DISCOVERER_REDIS_COLLECT_TIME);
     const data = {
@@ -192,29 +192,29 @@ class RedisDiscoverer extends BaseDiscoverer {
     const seq = this.localNode.seq;
     const key = this.BEAT_KEY + '|' + seq;
 
-    return this.Promise.resolve()
-      .then(() => {
-        // Create a multi pipeline
-        let pl = this.client.multi();
+    let pl = this.client.multi();
 
-        if (seq != this.lastBeatSeq) {
-          // Remove previous BEAT keys
-          pl = pl.del(this.BEAT_KEY + '|' + this.lastBeatSeq);
-          pl = pl.srem(this.BEAT_KEYS, this.BEAT_KEY + '|' + this.lastBeatSeq);
-        }
+    if (seq != this.lastBeatSeq) {
+      // Remove previous BEAT keys
+      pl = pl.del(this.BEAT_KEY + '|' + this.lastBeatSeq);
+      pl = pl.srem(this.BEAT_KEYS, this.BEAT_KEY + '|' + this.lastBeatSeq);
+    }
 
-        // Create new HB key
-        pl = pl.setex(key, this.opts.heartbeatTimeout, this.serializer.serialize(data, P.PACKET_HEARTBEAT));
-        pl = pl.sadd(this.BEAT_KEYS, key);
-        return pl.exec();
-      })
-      .then(() => this.lastBeatSeq = seq)
-      .then(() => this.fullCheckOnlineNodes())
-      .catch(err => this.logger.error('Error occured while scanning Redis keys.', err))
-      .then(() => {
-        timeEnd();
-        this.broker.metrics.increment(METRIC.MOLECULER_DISCOVERER_REDIS_COLLECT_TOTAL);
+    // Create new HB key
+    pl = pl.setex(key, this.opts.heartbeatTimeout, this.serializer.serialize(data, P.PACKET_HEARTBEAT));
+    pl = pl.sadd(this.BEAT_KEYS, key);
+
+    await pl.exec();
+
+    this.lastBeatSeq = seq;
+
+    await this.fullCheckOnlineNodes()
+      .catch(err => {
+        this.logger.error('Error occured while scanning Redis keys.', err);
       });
+
+    timeEnd();
+    this.broker.metrics.increment(METRIC.MOLECULER_DISCOVERER_REDIS_COLLECT_TOTAL);
   }
 
   async fullCheckOnlineNodes () {
@@ -261,6 +261,8 @@ class RedisDiscoverer extends BaseDiscoverer {
         if ((node.id !== this.broker.nodeID) && !availKeys.has(node.id)) {
           this.logger.warn(`Removing offline '${node.id}' node from registry because it hasn't submitted heartbeat signal.`);
           this.registry.nodes.disconnected(node.id, true);
+          // nodes.disconnected does not remove offline node from the registry
+          this.registry.nodes.delete(node.id);
         }
       });
     } catch (error) {
