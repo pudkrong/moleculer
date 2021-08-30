@@ -159,7 +159,8 @@ class RedisDiscoverer extends BaseDiscoverer {
 
 		if (this.opts.heartbeatInterval > 0) {
 			// HB timer
-			this._heartbeatInterval = this.opts.heartbeatInterval * 1000 + (Math.round(Math.random() * 1000) - 500); // random +/- 500ms
+			this._heartbeatInterval = (this.opts.heartbeatInterval + (Math.random() * (this.opts.heartbeatInterval / 2) | 0)) * 1000;
+      this.logger.error('HB', this._heartbeatInterval);
       this._startHeartbeatTimers();
 		}
 	}
@@ -294,8 +295,8 @@ class RedisDiscoverer extends BaseDiscoverer {
 
     if (refreshNodes.size === 0) return;
 
-    const keys = [...refreshNodes.keys()];
-    const nodeInfos = [...refreshNodes.values()];
+    const keys = [...refreshNodes.keys()].slice(10);
+    const nodeInfos = [...refreshNodes.values()].slice(10);
     const nodeFullInfos = await this.client.mgetBuffer(...nodeInfos);
 
     if (!nodeFullInfos.length) return;
