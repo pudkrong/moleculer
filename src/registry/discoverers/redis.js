@@ -266,7 +266,7 @@ class RedisDiscoverer extends BaseDiscoverer {
 
   async heartbeatReceived(onlineNodes) {
     const refreshNodes = new Map();
-    onlineNodes.forEach((onlineNodes, nodeID) => {
+    onlineNodes.forEach((payload, nodeID) => {
       const node = this.registry.nodes.get(nodeID);
       if (node) {
         if (!node.available) {
@@ -296,12 +296,12 @@ class RedisDiscoverer extends BaseDiscoverer {
 
     const keys = [...refreshNodes.keys()];
     const nodeInfos = [...refreshNodes.values()];
-    const payload = await this.client.mgetBuffer(...nodeInfos);
+    const nodeFullInfos = await this.client.mgetBuffer(...nodeInfos);
 
-    if (!payload) return;
+    if (!nodeFullInfos.length) return;
 
-    return this.Promise.all(payload.map((info, i) => {
-      if (!info) {
+    return this.Promise.all(nodeFullInfos.map((info, i) => {
+      if (info) {
         return this.discoverNode(keys[i], info);
       } else {
         return this.Promise.resolve();
