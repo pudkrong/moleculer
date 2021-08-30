@@ -253,10 +253,12 @@ class RedisDiscoverer extends BaseDiscoverer {
 
       this.lastBeatSeq = seq;
 
-      await this.fullCheckOnlineNodes().catch(error => {
-        this.logger.debug('fullCheckOnlineNodes:XXXX', error);
-      });
-    } finally {
+      await this.fullCheckOnlineNodes();
+    }
+    catch (error) {
+      this.logger.warn(`sendHeartbeat error`, error);
+    }
+    finally {
       timeEnd();
       this.broker.metrics.increment(METRIC.MOLECULER_DISCOVERER_REDIS_COLLECT_TOTAL);
     }
@@ -268,7 +270,10 @@ class RedisDiscoverer extends BaseDiscoverer {
       // Just exit if there is no node
       if (!scannedKeys.length) return;
 
-      const packets = await this.client.mgetBuffer(...scannedKeys);
+      const packets = await this.client.mgetBuffer(...scannedKeys).catch(error => {
+        this.logger.warn('MGET error', error);
+        throw error;
+      });
       const removedKeys = new Map();
       const availKeys = new Set();
       packets.forEach(async (raw, i) => {
