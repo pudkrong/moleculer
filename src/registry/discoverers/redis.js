@@ -55,6 +55,10 @@ class RedisDiscoverer extends BaseDiscoverer {
     this.lastBeatSeq = 0;
 
     this.reconnecting = false;
+    this._readyResolve = null;
+    this.ready = new this.Promise((resolve, reject) => {
+      this._readyResolve = resolve;
+    });
   }
 
   /**
@@ -100,6 +104,7 @@ class RedisDiscoverer extends BaseDiscoverer {
 
     this.client.on('connect', () => {
       /* istanbul ignore next */
+      this._readyResolve();
       this.logger.info('Redis Discoverer client connected.');
       if (this.reconnecting) {
         this.reconnecting = false;
@@ -338,7 +343,7 @@ class RedisDiscoverer extends BaseDiscoverer {
 	 * Discover all nodes (after connected)
 	 */
   discoverAllNodes () {
-    return this.fullCheckOnlineNodes();
+    return this.ready.then(this.fullCheckOnlineNodes);
   }
 
   /**
