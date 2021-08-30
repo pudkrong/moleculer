@@ -253,7 +253,9 @@ class RedisDiscoverer extends BaseDiscoverer {
 
       this.lastBeatSeq = seq;
 
-      await this.fullCheckOnlineNodes();
+      await this.fullCheckOnlineNodes().catch(error => {
+        this.logger.debug('fullCheckOnlineNodes:XXXX', error);
+      });
     } finally {
       timeEnd();
       this.broker.metrics.increment(METRIC.MOLECULER_DISCOVERER_REDIS_COLLECT_TOTAL);
