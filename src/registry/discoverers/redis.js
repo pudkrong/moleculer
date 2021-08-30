@@ -160,10 +160,16 @@ class RedisDiscoverer extends BaseDiscoverer {
 		if (this.heartbeatTimer) clearTimeout(this.heartbeatTimer);
 
     this.heartbeatTimer = setTimeout(async () => {
-      await this.localNode.updateLocalInfo(this.broker.getCpuUsage);
-      await this.sendHeartbeat();
-
-      this._startHeartbeatTimers();
+      try {
+        await this.localNode.updateLocalInfo(this.broker.getCpuUsage);
+        await this.sendHeartbeat();
+      }
+      catch (error) {
+        this.logger.warn(`Error occured while sending heartbeat`, error);
+      }
+      finally {
+        this._startHeartbeatTimers();
+      }
     }, this._heartbeatInterval);
     this.heartbeatTimer.unref();
   }
@@ -189,10 +195,16 @@ class RedisDiscoverer extends BaseDiscoverer {
   recreateInfoUpdateTimer () {
     if (this.infoUpdateTimer) clearTimeout(this.infoUpdateTimer);
 
-    this.infoUpdateTimer = setTimeout(() => {
-      // Reset the INFO packet expiry.
-      this.client.expire(this.INFO_KEY, this.opts.heartbeatTimeout * 10); // 10x from heartbeat timeoout
-      this.recreateInfoUpdateTimer();
+    this.infoUpdateTimer = setTimeout(async () => {
+      try {
+        // Reset the INFO packet expiry.
+        await this.client.expire(this.INFO_KEY, this.opts.heartbeatTimeout * 10); // 10x from heartbeat timeoout
+      } catch (error) {
+        this.logger.warn(`Error occured while recreateInfoUpdateTimer`, error);
+      }
+      finally {
+        this.recreateInfoUpdateTimer();
+      }
     }, this.opts.heartbeatInterval * 1000 * 10); // 10x from heartbeat interval
     this.infoUpdateTimer.unref();
   }
@@ -234,8 +246,6 @@ class RedisDiscoverer extends BaseDiscoverer {
       this.lastBeatSeq = seq;
 
       await this.fullCheckOnlineNodes();
-    } catch (error) {
-      this.logger.error('Error occured while sendHeartbeat', error);
     } finally {
       timeEnd();
       this.broker.metrics.increment(METRIC.MOLECULER_DISCOVERER_REDIS_COLLECT_TOTAL);
@@ -307,20 +317,21 @@ class RedisDiscoverer extends BaseDiscoverer {
 	 *
 	 * @param {String} nodeID
 	 */
-  discoverNode (nodeID) {
-    return this.client.getBuffer(`${this.PREFIX}-INFO:${nodeID}`)
-      .then(res => {
-        if (!res) {
-          this.logger.warn(`No INFO for '${nodeID}' node in registry.`);
-          return;
-        }
-        try {
-          const info = this.serializer.deserialize(res, P.PACKET_INFO);
-          return this.processRemoteNodeInfo(nodeID, info);
-        } catch (err) {
-          this.logger.warn('Unable to parse INFO packet', err, res);
-        }
-      });
+  async discoverNode (nodeID) {
+    try {
+      const res = await this.client.getBuffer(`${this.PREFIX}-INFO:${nodeID}`);
+      if (res === null) {
+        this.logger.warn(`No INFO for '${nodeID}' node in registry.`);
+        return;
+      }
+
+      const info = this.serializer.deserialize(res, P.PACKET_INFO);
+      return this.processRemoteNodeInfo(nodeID, info);
+    }
+    catch (error) {
+      this.logger.warn('Unable to parse INFO packet', err, res);
+      return;
+    }
   }
 
   /**
@@ -334,32 +345,31 @@ class RedisDiscoverer extends BaseDiscoverer {
 	 * Local service registry has been changed. We should notify remote nodes.
 	 * @param {String} nodeID
 	 */
-  sendLocalNodeInfo (nodeID) {
-    const info = this.broker.getLocalNodeInfo();
+  async sendLocalNodeInfo (nodeID) {
+    try {
+      const info = this.broker.getLocalNodeInfo();
 
-    const payload = Object.assign({
-      ver: this.broker.PROTOCOL_VERSION,
-      sender: this.broker.nodeID
-    }, info);
+      const payload = Object.assign({
+        ver: this.broker.PROTOCOL_VERSION,
+        sender: this.broker.nodeID
+      }, info);
 
-    const key = this.INFO_KEY;
-    const seq = this.localNode.seq;
-    // Set expires 10x from heartbeatTimeout;
-    const expires = this.opts.heartbeatTimeout * 10;
+      const key = this.INFO_KEY;
+      const seq = this.localNode.seq;
+      // Set expires 10x from heartbeatTimeout;
+      const expires = this.opts.heartbeatTimeout * 10;
 
-    const p = !nodeID && this.broker.options.disableBalancer ? this.transit.tx.makeBalancedSubscriptions() : this.Promise.resolve();
-    return p.then(() => this.client.setex(key, expires, this.serializer.serialize(payload, P.PACKET_INFO)))
-      .then(() => {
-        this.lastInfoSeq = seq;
+      const p = !nodeID && this.broker.options.disableBalancer ? this.transit.tx.makeBalancedSubscriptions() : this.Promise.resolve();
+      await p;
 
-        this.recreateInfoUpdateTimer();
+      this.lastInfoSeq = seq;
+      this.recreateInfoUpdateTimer();
 
-        // Sending a new heartbeat because it contains the `seq`
-        if (!nodeID) return this.beat();
-      })
-      .catch(err => {
-        this.logger.error('Unable to send INFO to Redis server', err);
-      });
+      // Sending a new heartbeat because it contains the `seq`
+      if (!nodeID) return this.beat();
+    } catch (error) {
+      this.logger.error('Unable to send INFO to Redis server', error);
+    }
   }
 
   /**
