@@ -264,6 +264,32 @@ class RedisDiscoverer extends BaseDiscoverer {
     }
   }
 
+  async heartbeatReceived(nodeID, payload) {
+		const node = this.registry.nodes.get(nodeID);
+		if (node) {
+			if (!node.available) {
+				// Reconnected node. Request a fresh INFO
+				return this.discoverNode(nodeID);
+			} else {
+				if (payload.seq != null && node.seq !== payload.seq) {
+					// Some services changed on the remote node. Request a new INFO
+					return this.discoverNode(nodeID);
+				} else if (
+					payload.instanceID != null &&
+					!node.instanceID.startsWith(payload.instanceID)
+				) {
+					// The node has been restarted. Request a new INFO
+					return this.discoverNode(nodeID);
+				} else {
+					return node.heartbeat(payload);
+				}
+			}
+		} else {
+			// Unknow node. Request an INFO
+			return this.discoverNode(nodeID);
+		}
+	}
+
   async fullCheckOnlineNodes () {
     try {
       const scannedKeys = await this.client.smembers(this.BEAT_KEYS).catch(error => {
