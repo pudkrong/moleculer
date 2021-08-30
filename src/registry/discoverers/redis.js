@@ -295,8 +295,8 @@ class RedisDiscoverer extends BaseDiscoverer {
 
     if (refreshNodes.size === 0) return;
 
-    const keys = [...refreshNodes.keys()].slice(0, 10);
-    const nodeInfos = [...refreshNodes.values()].slice(0, 10);
+    const keys = [...refreshNodes.keys()];
+    const nodeInfos = [...refreshNodes.values()];
     const nodeFullInfos = await this.client.mgetBuffer(...nodeInfos);
 
     if (!nodeFullInfos.length) return;
