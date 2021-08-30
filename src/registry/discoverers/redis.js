@@ -104,12 +104,15 @@ class RedisDiscoverer extends BaseDiscoverer {
 
     this.client.on('connect', () => {
       /* istanbul ignore next */
-      this._readyResolve();
       this.logger.info('Redis Discoverer client connected.');
       if (this.reconnecting) {
         this.reconnecting = false;
         this.sendLocalNodeInfo();
       }
+    });
+
+    this.client.on('ready', () => {
+      this._readyResolve();
     });
 
     this.client.on('reconnecting', () => {
@@ -343,7 +346,7 @@ class RedisDiscoverer extends BaseDiscoverer {
 	 * Discover all nodes (after connected)
 	 */
   discoverAllNodes () {
-    return this.ready.then(this.fullCheckOnlineNodes);
+    return this.ready.then(() => this.fullCheckOnlineNodes());
   }
 
   /**
@@ -352,8 +355,9 @@ class RedisDiscoverer extends BaseDiscoverer {
 	 */
   async sendLocalNodeInfo (nodeID) {
     try {
-      const info = this.broker.getLocalNodeInfo();
+      await this.ready;
 
+      const info = this.broker.getLocalNodeInfo();
       const payload = Object.assign({
         ver: this.broker.PROTOCOL_VERSION,
         sender: this.broker.nodeID
@@ -366,6 +370,8 @@ class RedisDiscoverer extends BaseDiscoverer {
 
       const p = !nodeID && this.broker.options.disableBalancer ? this.transit.tx.makeBalancedSubscriptions() : this.Promise.resolve();
       await p;
+
+      await this.client.setex(key, expires, this.serializer.serialize(payload, P.PACKET_INFO));
 
       this.lastInfoSeq = seq;
       this.recreateInfoUpdateTimer();
