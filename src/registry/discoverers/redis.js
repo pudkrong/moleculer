@@ -264,30 +264,49 @@ class RedisDiscoverer extends BaseDiscoverer {
     }
   }
 
-  async heartbeatReceived(nodeID, payload) {
-		const node = this.registry.nodes.get(nodeID);
-		if (node) {
-			if (!node.available) {
-				// Reconnected node. Request a fresh INFO
-				return this.discoverNode(nodeID);
-			} else {
-				if (payload.seq != null && node.seq !== payload.seq) {
-					// Some services changed on the remote node. Request a new INFO
-					return this.discoverNode(nodeID);
-				} else if (
-					payload.instanceID != null &&
-					!node.instanceID.startsWith(payload.instanceID)
-				) {
-					// The node has been restarted. Request a new INFO
-					return this.discoverNode(nodeID);
-				} else {
-					return node.heartbeat(payload);
-				}
-			}
-		} else {
-			// Unknow node. Request an INFO
-			return this.discoverNode(nodeID);
-		}
+  async heartbeatReceived(onlineNodes) {
+    const refreshNodes = new Map();
+    onlineNodes.forEach((onlineNodes, nodeID) => {
+      const node = this.registry.nodes.get(nodeID);
+      if (node) {
+        if (!node.available) {
+          // Reconnected node. Request a fresh INFO
+          refreshNodes.set(nodeID, `${this.PREFIX}-INFO:${nodeID}`);
+        } else {
+          if (payload.seq != null && node.seq !== payload.seq) {
+            // Some services changed on the remote node. Request a new INFO
+            refreshNodes.set(nodeID, `${this.PREFIX}-INFO:${nodeID}`);
+          } else if (
+            payload.instanceID != null &&
+            !node.instanceID.startsWith(payload.instanceID)
+          ) {
+            // The node has been restarted. Request a new INFO
+            refreshNodes.set(nodeID, `${this.PREFIX}-INFO:${nodeID}`);
+          } else {
+            node.heartbeat(payload);
+          }
+        }
+      } else {
+        // Unknow node. Request an INFO
+        refreshNodes.set(nodeID, `${this.PREFIX}-INFO:${nodeID}`);
+      }
+    });
+
+    if (refreshNodes.size === 0) return;
+
+    const keys = [...refreshNodes.keys()];
+    const nodeInfos = [...refreshNodes.values()];
+    const payload = await this.client.mgetBuffer(...nodeInfos);
+
+    if (!payload) return;
+
+    return this.Promise.all(payload.map((info, i) => {
+      if (!info) {
+        return this.discoverNode(keys[i], info);
+      } else {
+        return this.Promise.resolve();
+      }
+    }));
 	}
 
   async fullCheckOnlineNodes () {
@@ -304,7 +323,7 @@ class RedisDiscoverer extends BaseDiscoverer {
         throw error;
       });
       const removedKeys = new Map();
-      const availKeys = new Set();
+      const availKeys = new Map();
       packets.forEach(async (raw, i) => {
         const p = scannedKeys[i].substring(`${this.PREFIX}-BEAT:`.length).split('|');
         if (raw !== null) {
@@ -316,14 +335,16 @@ class RedisDiscoverer extends BaseDiscoverer {
           };
 
           if (packet.sender !== this.broker.nodeID) {
-            availKeys.add(packet.sender);
-            await this.heartbeatReceived(packet.sender, packet);
+            availKeys.add(packet.sender, packet);
           }
         } else {
           // If key is expired, just remove
           removedKeys.set(p[0], scannedKeys[i]);
         }
       });
+
+      // Mulk heartbeat received
+      await this.heartbeatReceived(availKeys);
 
       // Remove expired HB from set and remove from registry
       // We have to check again with available nodes because each node might have more than 1 beat (many seq)
@@ -361,19 +382,21 @@ class RedisDiscoverer extends BaseDiscoverer {
 	 *
 	 * @param {String} nodeID
 	 */
-  async discoverNode (nodeID) {
+  async discoverNode (nodeID, nodeInfo = null) {
     try {
-      const res = await this.client.getBuffer(`${this.PREFIX}-INFO:${nodeID}`)
-        .catch(error => {
-          this.logger.debug('ERROR: discoverNode', error);
-          throw error;
-        });
-      if (res === null) {
-        this.logger.warn(`No INFO for '${nodeID}' node in registry.`);
-        return;
+      if (!nodeInfo) {
+        nodeInfo = await this.client.getBuffer(`${this.PREFIX}-INFO:${nodeID}`)
+          .catch(error => {
+            this.logger.error('ERROR: discoverNode', error);
+            throw error;
+          });
+        if (nodeInfo === null) {
+          this.logger.warn(`No INFO for '${nodeID}' node in registry.`);
+          return;
+        }
       }
 
-      const info = this.serializer.deserialize(res, P.PACKET_INFO);
+      const info = this.serializer.deserialize(nodeInfo, P.PACKET_INFO);
       return this.processRemoteNodeInfo(nodeID, info);
     }
     catch (error) {
