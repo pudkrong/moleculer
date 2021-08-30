@@ -337,7 +337,7 @@ class RedisDiscoverer extends BaseDiscoverer {
       return this.processRemoteNodeInfo(nodeID, info);
     }
     catch (error) {
-      this.logger.warn('Unable to parse INFO packet', err, res);
+      this.logger.warn('Unable to parse INFO packet', error);
       return;
     }
   }
