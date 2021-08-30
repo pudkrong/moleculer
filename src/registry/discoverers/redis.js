@@ -335,7 +335,7 @@ class RedisDiscoverer extends BaseDiscoverer {
           };
 
           if (packet.sender !== this.broker.nodeID) {
-            availKeys.add(packet.sender, packet);
+            availKeys.set(packet.sender, packet);
           }
         } else {
           // If key is expired, just remove
