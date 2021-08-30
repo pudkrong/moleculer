@@ -266,7 +266,10 @@ class RedisDiscoverer extends BaseDiscoverer {
 
   async fullCheckOnlineNodes () {
     try {
-      const scannedKeys = await this.client.smembers(this.BEAT_KEYS);
+      const scannedKeys = await this.client.smembers(this.BEAT_KEYS).catch(error => {
+        this.logger.warn('smembers error', error);
+        throw error;
+      });
       // Just exit if there is no node
       if (!scannedKeys.length) return;
 
