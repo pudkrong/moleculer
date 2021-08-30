@@ -363,7 +363,11 @@ class RedisDiscoverer extends BaseDiscoverer {
 	 */
   async discoverNode (nodeID) {
     try {
-      const res = await this.client.getBuffer(`${this.PREFIX}-INFO:${nodeID}`);
+      const res = await this.client.getBuffer(`${this.PREFIX}-INFO:${nodeID}`)
+        .catch(error => {
+          this.logger.debug('ERROR: discoverNode', error);
+          throw error;
+        });
       if (res === null) {
         this.logger.warn(`No INFO for '${nodeID}' node in registry.`);
         return;
