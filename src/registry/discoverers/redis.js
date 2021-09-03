@@ -38,14 +38,10 @@ class RedisDiscoverer extends BaseDiscoverer {
     this.opts = _.defaultsDeep(this.opts, {
       redis: null,
       serializer: 'JSON',
-      fullCheck: 10, // Disable with `0` or `null`
-      scanLength: 100,
+      failThreshold: 3,
+      successThreshold: 1,
       monitor: false
     });
-
-    // Loop counter for full checks. Starts from a random value for better distribution
-    this.idx = this.opts.fullCheck > 1 ? _.random(this.opts.fullCheck - 1) : 0;
-
     // Redis client instance
     this.client = null;
 
@@ -57,7 +53,10 @@ class RedisDiscoverer extends BaseDiscoverer {
     this.lastBeatSeq = 0;
 
     this.reconnecting = false;
+
     this._syncingOnlineNodeInfo = false;
+    this._onlineNodes = new Map();
+    this._offlineNodes = new Map();
   }
 
   /**
@@ -84,7 +83,7 @@ class RedisDiscoverer extends BaseDiscoverer {
     this.logger.warn(
       kleur
         .yellow()
-        .bold('Redis Discoverer is an EXPERIMENTAL module. Do NOT use it in production!')
+        .bold('PUD Redis Discoverer is an EXPERIMENTAL module. Do NOT use it in production!')
     );
 
     // Using shorter instanceID to reduce the network traffic
@@ -162,10 +161,12 @@ class RedisDiscoverer extends BaseDiscoverer {
    */
   stop () {
     if (this.infoUpdateTimer) clearTimeout(this.infoUpdateTimer);
+    this.stopHeartbeatTimers();
 
-    return super.stop().then(() => {
-      if (this.client) return this.client.quit();
-    });
+    return super.stop()
+      .finally(() => {
+        if (this.client) return this.client.quit();
+      });
   }
 
   startHeartbeatTimers () {
@@ -186,7 +187,10 @@ class RedisDiscoverer extends BaseDiscoverer {
       // this.checkNodesTimer.unref();
 
       // Clean offline nodes timer
-      this.offlineTimer = setInterval(() => this.checkOfflineNodes(), 60 * 1000); // 1 min
+      this.offlineTimer = setInterval(() => {
+        this.checkOfflineNodes();
+        this.cleanOfflineNodesOnRemoteRegistry();
+      }, 60 * 1000); // 1 min/
       this.offlineTimer.unref();
     }
   }
@@ -257,11 +261,24 @@ class RedisDiscoverer extends BaseDiscoverer {
     this.infoUpdateTimer.unref();
   }
 
+  async cleanOfflineNodesOnRemoteRegistry () {
+    try {
+      const maxTime = new Date().getTime() - (this.opts.cleanOfflineNodesTimeout * 1000);
+      const cleaningNodes = await this.client.zrangebyscore(this.BEAT_KEY_SORTED_SET, '-inf', maxTime);
+      if (cleaningNodes.length) {
+        await this.client.hdel(this.BEAT_KEY_HASH, ...cleaningNodes);
+      }
+    } catch (error) {
+      this.logger.warn(`cleanOfflineNodesOnRemoteRegistry error: `, error);
+    }
+  }
+
   /**
    * Sending a local heartbeat to Redis.
    */
   async sendHeartbeat () {
     let timeEnd;
+    const tt = process.hrtime();
 
     try {
       timeEnd = this.broker.metrics.timer(METRIC.MOLECULER_DISCOVERER_REDIS_COLLECT_TIME);
@@ -286,12 +303,15 @@ class RedisDiscoverer extends BaseDiscoverer {
 
       this.lastBeatSeq = seq;
 
-      await this.collectOnlineNodes();
+      if (!this._syncingOnlineNodeInfo) setImmediate(this.collectOnlineNodes.bind(this));
     } catch (error) {
       this.logger.error('Error occured while scanning Redis keys.', error);
     } finally {
       timeEnd();
       this.broker.metrics.increment(METRIC.MOLECULER_DISCOVERER_REDIS_COLLECT_TOTAL);
+
+      const tt2 = process.hrtime(tt);
+      this.logger.info(`sendHeartbeat took ${tt2[0]}s ${tt2[1] / 1000000 | 0}ms`);
     }
   }
 
@@ -299,49 +319,90 @@ class RedisDiscoverer extends BaseDiscoverer {
    * Collect online nodes from Redis server.
    */
   async collectOnlineNodes () {
-    // Get the current node list so that we can check the disconnected nodes.
-    const prevNodes = this.registry.nodes
-      .list({ onlyAvailable: true, withServices: false })
-      .map(node => node.id)
-      .filter(nodeID => nodeID !== this.broker.nodeID);
+    try {
+      this._syncingOnlineNodeInfo = true;
 
-    const expiredTime = new Date().getTime() - (this.opts.heartbeatTimeout * 1000);
-    const [ offlineNodes, onlineNodes ] = await this.client
-      .multi()
-      .zrangebyscore(this.BEAT_KEYS, '-inf', expiredTime)
-      .zrangebyscore(this.BEAT_KEYS, expiredTime, '+inf')
-      .zremrangebyscore(this.BEAT_KEYS, '-inf', expiredTime)
-      .exec();
+      // Get the current node list so that we can check the disconnected nodes.
+      const prevNodes = this.registry.nodes
+        .list({ onlyAvailable: true, withServices: false })
+        .map(node => node.id)
+        .filter(nodeID => nodeID !== this.broker.nodeID);
 
-    if (offlineNodes[1].length) await this.client.hdel(this.BEAT_KEY_HASH, ...offlineNodes[1]);
+      const expiredTime = new Date().getTime() - (this.opts.heartbeatTimeout * 1000);
+      const [ offlineNodes, onlineNodes ] = await this.client
+        .multi()
+        .zrangebyscore(this.BEAT_KEY_SORTED_SET, '-inf', expiredTime)
+        .zrangebyscore(this.BEAT_KEY_SORTED_SET, expiredTime, '+inf')
+        .exec();
 
-    // Discover online nodes
-    if (onlineNodes[1].length) {
-      const rawPackets = await this.client.hmgetBuffer(this.BEAT_KEY_HASH, ...onlineNodes[1]);
-      let packets = rawPackets.map((raw) => this.serializer.deserialize(raw, P.PACKET_INFO));
-      packets = packets.filter(packet => packet.sender !== this.broker.nodeID);
-      packets.forEach(packet => {
-        removeFromArray(prevNodes, packet.sender);
+      // Counting threshold
+      const removingNodes = [];
+      offlineNodes[1].forEach((n) => {
+        let count = this._offlineNodes.get(n) || 0;
+        this._offlineNodes.set(n, ++count);
+        if (count >= this.opts.failThreshold) {
+          removingNodes.push(n);
+          this._onlineNodes.delete(n);
+        }
+      });
+      onlineNodes[1].forEach((n) => {
+        const count = this._onlineNodes.get(n) || 0;
+        this._onlineNodes.set(n, count + 1);
+        this._offlineNodes.delete(n);
       });
 
-      if (!this._syncingOnlineNodeInfo) this.bulkHeartbeatReceived(packets);
-    }
+      // Check online nodes againts success threshold
+      const addingNodes = [];
+      this._onlineNodes.forEach((v, k) => {
+        if (v >= this.opts.successThreshold) addingNodes.push(k);
+      });
 
-    // Remove offline nodes
-    if (prevNodes.length > 0) {
+      // Discover online nodes
+      if (addingNodes.length) {
+        const rawPackets = await this.client.hmgetBuffer(this.BEAT_KEY_HASH, ...addingNodes);
+        let packets = rawPackets.map((raw) => {
+          if (raw) return this.serializer.deserialize(raw, P.PACKET_INFO);
+        });
+        packets = packets.filter(packet => packet && (packet.sender !== this.broker.nodeID));
+        packets.forEach(packet => {
+          removeFromArray(prevNodes, packet.sender);
+        });
+
+        await this.bulkHeartbeatReceived(packets);
+      }
+
+      // Remove offline nodes
+      if (prevNodes.length > 0) {
       // Disconnected nodes
-      prevNodes.forEach(nodeID => {
-        this.logger.info(
-          `The node '${nodeID}' is not available. Removing from registry...`
-        );
-        this.remoteNodeDisconnected(nodeID, true);
-      });
+        prevNodes.forEach(nodeID => {
+          this.logger.info(
+            `The node '${nodeID}' is not available. Removing from registry...`
+          );
+          this.remoteNodeDisconnected(nodeID, true);
+        });
+      }
+
+      // Removing offline nodes which are failed over threshold
+      if (removingNodes.length > 0) {
+        // Disconnected nodes
+        removingNodes.forEach(node => {
+          const p = node.substring(`${this.PREFIX}-BEAT:`.length).split('|');
+          const nodeID = p[0];
+          this.logger.info(
+            `The node '${nodeID}' is not available due to overing fail threshold (${this.opts.failThreshold}). Removing from registry...`
+          );
+          this.remoteNodeDisconnected(nodeID, true);
+        });
+        await this.client.zrem(this.BEAT_KEY_SORTED_SET, ...removingNodes);
+      }
+    } catch (error) {
+      this.logger.warn(`collectOnlineNodes has error`, error);
+    } finally {
+      this._syncingOnlineNodeInfo = false;
     }
   }
 
   async bulkHeartbeatReceived (packets) {
-    this._syncingOnlineNodeInfo = true;
-
     const chunkSize = 10;
     const chunks = Array((Math.ceil(packets.length / chunkSize)))
       .fill()
@@ -356,8 +417,6 @@ class RedisDiscoverer extends BaseDiscoverer {
       await this.Promise.all(p);
       await this._delayWithRandom(2);
     }
-
-    this._syncingOnlineNodeInfo = false;
   }
 
   _delayWithRandom (wait) {
@@ -398,7 +457,7 @@ class RedisDiscoverer extends BaseDiscoverer {
    * @param {String} nodeID
    */
   async discoverNode (nodeID) {
-    const res = await this.client.getBuffer(this.INFO_KEY);
+    const res = await this.client.getBuffer(`${this.PREFIX}-INFO:${nodeID}`);
     if (!res) {
       this.logger.warn(`No INFO for '${nodeID}' node in registry.`);
       return;
@@ -408,7 +467,7 @@ class RedisDiscoverer extends BaseDiscoverer {
       const info = this.serializer.deserialize(res, P.PACKET_INFO);
       return this.processRemoteNodeInfo(nodeID, info);
     } catch (err) {
-      this.logger.warn('Unable to parse INFO packet', err, res);
+      this.logger.warn('Unable to parse INFO packet', err);
     }
   }
 
