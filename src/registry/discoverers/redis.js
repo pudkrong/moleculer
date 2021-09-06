@@ -278,7 +278,6 @@ class RedisDiscoverer extends BaseDiscoverer {
    */
   async sendHeartbeat () {
     let timeEnd;
-    const tt = process.hrtime();
 
     try {
       timeEnd = this.broker.metrics.timer(METRIC.MOLECULER_DISCOVERER_REDIS_COLLECT_TIME);
@@ -309,9 +308,6 @@ class RedisDiscoverer extends BaseDiscoverer {
     } finally {
       timeEnd();
       this.broker.metrics.increment(METRIC.MOLECULER_DISCOVERER_REDIS_COLLECT_TOTAL);
-
-      const tt2 = process.hrtime(tt);
-      this.logger.info(`sendHeartbeat took ${tt2[0]}s ${tt2[1] / 1000000 | 0}ms`);
     }
   }
 
@@ -323,10 +319,12 @@ class RedisDiscoverer extends BaseDiscoverer {
       this._syncingOnlineNodeInfo = true;
 
       // Get the current node list so that we can check the disconnected nodes.
-      const prevNodes = this.registry.nodes
+      const prevNodes = new Map();
+      this.registry.nodes
         .list({ onlyAvailable: true, withServices: false })
-        .map(node => node.id)
-        .filter(nodeID => nodeID !== this.broker.nodeID);
+        .forEach(node => {
+          if (node.id !== this.broker.nodeID) prevNodes.set(node.id, node);
+        });
 
       const expiredTime = new Date().getTime() - (this.opts.heartbeatTimeout * 1000);
       const [ offlineNodes, onlineNodes ] = await this.client
@@ -335,26 +333,29 @@ class RedisDiscoverer extends BaseDiscoverer {
         .zrangebyscore(this.BEAT_KEY_SORTED_SET, expiredTime, '+inf')
         .exec();
 
-      // Counting threshold
-      const removingNodes = [];
+      // increase by 1 to all nodes in offline and online
+      this._offlineNodes.forEach((v, k) => this._offlineNodes.set(k, ++v));
+      this._onlineNodes.forEach((v, k) => this._onlineNodes.set(k, ++v));
+
+      // Adding new offline nodes and remove from online nodes
       offlineNodes[1].forEach((n) => {
-        let count = this._offlineNodes.get(n) || 0;
-        this._offlineNodes.set(n, ++count);
-        if (count >= this.opts.failThreshold) {
-          removingNodes.push(n);
-          this._onlineNodes.delete(n);
-        }
+        if (!this._offlineNodes.has(n)) this._offlineNodes.set(n, 1);
+        this._onlineNodes.delete(n);
       });
+      // Adding new online nodes and remove from offline nodes
       onlineNodes[1].forEach((n) => {
-        const count = this._onlineNodes.get(n) || 0;
-        this._onlineNodes.set(n, count + 1);
+        if (!this._onlineNodes.has(n)) this._onlineNodes.set(n, 1);
         this._offlineNodes.delete(n);
       });
 
       // Check online nodes againts success threshold
       const addingNodes = [];
       this._onlineNodes.forEach((v, k) => {
-        if (v >= this.opts.successThreshold) addingNodes.push(k);
+        if (v >= this.opts.successThreshold) {
+          addingNodes.push(k);
+          // Clean one that already exceed the threshold
+          this._onlineNodes.delete(k);
+        }
       });
 
       // Discover online nodes
@@ -365,29 +366,35 @@ class RedisDiscoverer extends BaseDiscoverer {
         });
         packets = packets.filter(packet => packet && (packet.sender !== this.broker.nodeID));
         packets.forEach(packet => {
-          removeFromArray(prevNodes, packet.sender);
+          prevNodes.delete(packet.sender);
         });
 
         await this.bulkHeartbeatReceived(packets);
       }
 
-      // Remove offline nodes
-      if (prevNodes.length > 0) {
-      // Disconnected nodes
-        prevNodes.forEach(nodeID => {
-          this.logger.info(
-            `The node '${nodeID}' is not available. Removing from registry...`
-          );
-          this.remoteNodeDisconnected(nodeID, true);
-        });
-      }
+      // Add offline nodes from registry to offline to track later
+      prevNodes.forEach(node => {
+        const key = `${this.PREFIX}-BEAT:${node.id}|${node.instanceID.substring(0, 8)}`;
+        if (!this._offlineNodes.has(key)) this._offlineNodes.set(key, 1);
+      });
 
       // Removing offline nodes which are failed over threshold
+      const removingNodes = [];
+      this._offlineNodes.forEach((v, k) => {
+        if (v >= this.opts.failThreshold) {
+          removingNodes.push(k);
+          // Clean one that already exceed the threshold
+          this._offlineNodes.delete(k);
+        }
+      });
+
       if (removingNodes.length > 0) {
         // Disconnected nodes
         removingNodes.forEach(node => {
           const p = node.substring(`${this.PREFIX}-BEAT:`.length).split('|');
           const nodeID = p[0];
+          if (nodeID === this.broker.nodeID) return;
+
           this.logger.info(
             `The node '${nodeID}' is not available due to overing fail threshold (${this.opts.failThreshold}). Removing from registry...`
           );
@@ -475,7 +482,8 @@ class RedisDiscoverer extends BaseDiscoverer {
    * Discover all nodes (after connected)
    */
   discoverAllNodes () {
-    return this.collectOnlineNodes();
+    if (!this._syncingOnlineNodeInfo) setImmediate(this.collectOnlineNodes.bind(this));
+    return this.Promise.resolve();
   }
 
   /**
