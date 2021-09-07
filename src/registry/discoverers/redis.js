@@ -405,7 +405,6 @@ class RedisDiscoverer extends BaseDiscoverer {
           );
           this.remoteNodeDisconnected(nodeID, true);
         });
-        await this.client.zrem(this.BEAT_KEY_SORTED_SET, ...removingNodes);
       }
     } catch (error) {
       this.logger.warn(`collectOnlineNodes has error`, error);
