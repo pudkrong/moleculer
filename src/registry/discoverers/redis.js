@@ -199,12 +199,17 @@ class RedisDiscoverer extends BaseDiscoverer {
     if (this.heartbeatTimer) clearTimeout(this.heartbeatTimer);
 
     this.heartbeatTimer = setTimeout(async () => {
+      let timer = process.hrtime();
       try {
         await this.localNode.updateLocalInfo(this.broker.getCpuUsage);
         await this.sendHeartbeat();
       } catch (error) {
         this.logger.warn(`Error occured while sending heartbeat`, error);
       } finally {
+        const r = process.hrtime(timer);
+        if (r[0] >= 3) {
+          this.logger.error(`${this.broker.nodeID} took more than 3s to heartbeat`, r);
+        }
         this._startHeartbeatTimers();
       }
     }, this._heartbeatInterval);
