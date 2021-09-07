@@ -13,7 +13,7 @@ const { BrokerOptionsError } = require('../../errors');
 const BaseDiscoverer = require('./base');
 const { METRIC } = require('../../metrics');
 // const Serializers = require('../../serializers');
-const { removeFromArray, isFunction } = require('../../utils');
+const { isFunction } = require('../../utils');
 const P = require('../../packets');
 const zlib = require('zlib');
 
@@ -92,6 +92,7 @@ class RedisDiscoverer extends BaseDiscoverer {
     this.PREFIX = `MOL${this.broker.namespace ? '-' + this.broker.namespace : ''}-DSCVR`;
     this.BEAT_KEY = `${this.PREFIX}-BEAT:${this.broker.nodeID}|${this.instanceHash}`;
     this.INFO_KEY = `${this.PREFIX}-INFO:${this.broker.nodeID}`;
+    this.INFO_KEY_HASH = `${this.PREFIX}-INFO-HASH`;
 
     this.BEAT_KEY_SORTED_SET = `${this.PREFIX}-BEAT-SORTED-SET`;
     this.BEAT_KEY_HASH = `${this.PREFIX}-BEAT-HASH`;
@@ -271,7 +272,16 @@ class RedisDiscoverer extends BaseDiscoverer {
       const maxTime = new Date().getTime() - (this.opts.cleanOfflineNodesTimeout * 1000);
       const cleaningNodes = await this.client.zrangebyscore(this.BEAT_KEY_SORTED_SET, '-inf', maxTime);
       if (cleaningNodes.length) {
-        await this.client.hdel(this.BEAT_KEY_HASH, ...cleaningNodes);
+        const nodeIDs = cleaningNodes.map((node) => {
+          const p = node.substring(`${this.PREFIX}-BEAT:`.length).split('|');
+          return p[0];
+        });
+        await this.client
+          .multi()
+          .hdel(this.BEAT_KEY_HASH, ...cleaningNodes)
+          .zrem(this.BEAT_KEY_SORTED_SET, ...cleaningNodes)
+          .hdel(this.INFO_KEY_HASH, ...nodeIDs)
+          .exec();
       }
     } catch (error) {
       this.logger.warn(`cleanOfflineNodesOnRemoteRegistry error: `, error);
@@ -332,9 +342,10 @@ class RedisDiscoverer extends BaseDiscoverer {
         });
 
       const expiredTime = new Date().getTime() - (this.opts.heartbeatTimeout * 1000);
+      const lowerBoundExpiredTime = new Date().getTime() - (this.opts.heartbeatTimeout * this.opts.failThreshold * 1000);
       const [ offlineNodes, onlineNodes ] = await this.client
         .multi()
-        .zrangebyscore(this.BEAT_KEY_SORTED_SET, '-inf', expiredTime)
+        .zrangebyscore(this.BEAT_KEY_SORTED_SET, lowerBoundExpiredTime, expiredTime)
         .zrangebyscore(this.BEAT_KEY_SORTED_SET, expiredTime, '+inf')
         .exec();
 
@@ -356,7 +367,7 @@ class RedisDiscoverer extends BaseDiscoverer {
       // Check online nodes againts success threshold
       const addingNodes = [];
       this._onlineNodes.forEach((v, k) => {
-        if (v >= this.opts.successThreshold) {
+        if (v === this.opts.successThreshold) {
           addingNodes.push(k);
           // Clean one that already exceed the threshold
           this._onlineNodes.delete(k);
@@ -386,7 +397,7 @@ class RedisDiscoverer extends BaseDiscoverer {
       // Removing offline nodes which are failed over threshold
       const removingNodes = [];
       this._offlineNodes.forEach((v, k) => {
-        if (v >= this.opts.failThreshold) {
+        if (v === this.opts.failThreshold) {
           removingNodes.push(k);
           // Clean one that already exceed the threshold
           this._offlineNodes.delete(k);
@@ -421,11 +432,21 @@ class RedisDiscoverer extends BaseDiscoverer {
       .map(begin => packets.slice(begin, begin + chunkSize));
 
     for (let chunk of chunks) {
-      const p = chunk.map(packet => {
-        return this.heartbeatReceived(packet.sender, packet);
+      const newNodes = [];
+      const existingNodes = [];
+      chunk.forEach(packet => {
+        const node = this.registry.nodes.get(packet.sender);
+        if (node) {
+          existingNodes.push(packet);
+        } else {
+          newNodes.push(packet);
+        }
       });
 
-      await this.Promise.all(p);
+      const p1 = existingNodes.map(packet => this.heartbeatReceived(packet.sender, packet));
+      const p2 = this._addNewNodes(newNodes);
+
+      await this.Promise.all(p1.concat(p2));
       await this._delayWithRandom(2);
     }
   }
@@ -467,11 +488,13 @@ class RedisDiscoverer extends BaseDiscoverer {
    *
    * @param {String} nodeID
    */
-  async discoverNode (nodeID) {
-    const res = await this.client.getBuffer(`${this.PREFIX}-INFO:${nodeID}`);
+  async discoverNode (nodeID, res = null) {
     if (!res) {
-      this.logger.warn(`No INFO for '${nodeID}' node in registry.`);
-      return;
+      res = await this.client.getBuffer(`${this.PREFIX}-INFO:${nodeID}`);
+      if (!res) {
+        this.logger.warn(`No INFO for '${nodeID}' node in registry.`);
+        return;
+      }
     }
 
     try {
@@ -485,9 +508,22 @@ class RedisDiscoverer extends BaseDiscoverer {
   /**
    * Discover all nodes (after connected)
    */
-  discoverAllNodes () {
-    if (!this._syncingOnlineNodeInfo) setImmediate(this.collectOnlineNodes.bind(this));
-    return this.Promise.resolve();
+  async discoverAllNodes () {
+    this.logger.info(`discover all nodes`);
+    return this.collectOnlineNodes();
+  }
+
+  async _addNewNodes (packets) {
+    const nodeIDs = packets.map(p => p.sender);
+    if (nodeIDs.length) {
+      const infos = await this.client.hmgetBuffer(this.INFO_KEY_HASH, ...nodeIDs);
+      for (let i = 0; i < infos.length; i++) {
+        const info = infos[i];
+        if (info) {
+          await this.discoverNode(nodeIDs[i], info);
+        }
+      }
+    }
   }
 
   /**
@@ -512,9 +548,14 @@ class RedisDiscoverer extends BaseDiscoverer {
       !nodeID && this.broker.options.disableBalancer
         ? this.transit.tx.makeBalancedSubscriptions()
         : this.Promise.resolve();
+    const serializedPayload = this.serializer.serialize(payload, P.PACKET_INFO);
     return p
       .then(() =>
-        this.client.setex(key, 30 * 60, this.serializer.serialize(payload, P.PACKET_INFO))
+        this.client
+          .multi()
+          .setex(key, 30 * 60, serializedPayload)
+          .hset(this.INFO_KEY_HASH, this.broker.nodeID, serializedPayload)
+          .exec()
       )
       .then(() => {
         this.lastInfoSeq = seq;
@@ -540,6 +581,7 @@ class RedisDiscoverer extends BaseDiscoverer {
         return this.client
           .multi()
           .del(this.INFO_KEY)
+          .hdel(this.INFO_KEY_HASH, this.broker.nodeID)
           .zrem(this.BEAT_KEY_SORTED_SET, this.BEAT_KEY)
           .hdel(this.BEAT_KEY_HASH, this.BEAT_KEY)
           .exec();
