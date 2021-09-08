@@ -16,6 +16,7 @@ const { METRIC } = require('../../metrics');
 const { isFunction } = require('../../utils');
 const P = require('../../packets');
 const zlib = require('zlib');
+const workerpool = require('workerpool');
 
 let Redis;
 
@@ -154,6 +155,12 @@ class RedisDiscoverer extends BaseDiscoverer {
       }
     };
 
+    process.env.REDIS_CONTEXT = JSON.stringify({
+      redis: this.opts.redis
+    });
+    this.pool = workerpool.pool(`${__dirname}/workers/heartbeat.js`, {
+      workerType: 'thread'
+    });
     this.logger.debug('Redis Discoverer created. Prefix:', this.PREFIX);
   }
 
@@ -163,6 +170,9 @@ class RedisDiscoverer extends BaseDiscoverer {
   stop () {
     if (this.infoUpdateTimer) clearTimeout(this.infoUpdateTimer);
     this.stopHeartbeatTimers();
+
+    // Stop all worker threads
+    if (this.pool) this.pool.terminate();
 
     return super.stop()
       .finally(() => {
@@ -309,15 +319,11 @@ class RedisDiscoverer extends BaseDiscoverer {
       const seq = this.localNode.seq;
 
       // Create a multi pipeline
-      await this.client
-        .multi()
-        .hset(this.BEAT_KEY_HASH, this.BEAT_KEY, this.serializer.serialize(data, P.PACKET_HEARTBEAT))
-        .zadd(this.BEAT_KEY_SORTED_SET, 'gt', new Date().getTime(), this.BEAT_KEY)
-        .exec();
+      await this.pool.exec('heartbeat', [this.BEAT_KEY_HASH, this.BEAT_KEY_SORTED_SET, this.BEAT_KEY, data]);
 
       this.lastBeatSeq = seq;
 
-      if (!this._syncingOnlineNodeInfo) setImmediate(this.collectOnlineNodes.bind(this));
+      if (!this._syncingOnlineNodeInfo) this.collectOnlineNodes();
     } catch (error) {
       this.logger.error('Error occured while scanning Redis keys.', error);
     } finally {
@@ -331,6 +337,8 @@ class RedisDiscoverer extends BaseDiscoverer {
    */
   async collectOnlineNodes () {
     try {
+      const self = this;
+      let hasHeartbeat = false;
       this._syncingOnlineNodeInfo = true;
 
       // Get the current node list so that we can check the disconnected nodes.
@@ -341,113 +349,70 @@ class RedisDiscoverer extends BaseDiscoverer {
           if (node.id !== this.broker.nodeID) prevNodes.set(node.id, node);
         });
 
-      const expiredTime = new Date().getTime() - (this.opts.heartbeatTimeout * 1000);
-      const lowerBoundExpiredTime = new Date().getTime() - (this.opts.heartbeatTimeout * this.opts.failThreshold * 1000);
-      const [ offlineNodes, onlineNodes ] = await this.client
-        .multi()
-        .zrangebyscore(this.BEAT_KEY_SORTED_SET, lowerBoundExpiredTime, expiredTime)
-        .zrangebyscore(this.BEAT_KEY_SORTED_SET, expiredTime, '+inf')
-        .exec();
-
-      // increase by 1 to all nodes in offline and online
-      this._offlineNodes.forEach((v, k) => this._offlineNodes.set(k, ++v));
-      this._onlineNodes.forEach((v, k) => this._onlineNodes.set(k, ++v));
-
-      // Adding new offline nodes and remove from online nodes
-      offlineNodes[1].forEach((n) => {
-        if (!this._offlineNodes.has(n)) this._offlineNodes.set(n, 1);
-        this._onlineNodes.delete(n);
-      });
-      // Adding new online nodes and remove from offline nodes
-      onlineNodes[1].forEach((n) => {
-        if (!this._onlineNodes.has(n)) this._onlineNodes.set(n, 1);
-        this._offlineNodes.delete(n);
-      });
-
-      // Check online nodes againts success threshold
-      const addingNodes = [];
-      this._onlineNodes.forEach((v, k) => {
-        if (v === this.opts.successThreshold) {
-          addingNodes.push(k);
-          // Clean one that already exceed the threshold
-          this._onlineNodes.delete(k);
+      await this.pool.exec(
+        'collectOnlineNodes',
+        [
+          this.BEAT_KEY_HASH,
+          this.BEAT_KEY_SORTED_SET,
+          this.BEAT_KEY,
+          prevNodes,
+          this.broker.nodeID,
+          this.PREFIX,
+          this.opts
+        ],
+        {
+          on: (payload) => {
+            switch (payload.type) {
+              case 'remoteNodeDisconnected':
+                self.remoteNodeDisconnected(payload.payload.nodeID, true);
+                break;
+              case 'bulkHeartbeatReceived':
+                hasHeartbeat = true;
+                self.bulkHeartbeatReceived(payload.payload.packets);
+                break;
+              case 'completed':
+                if (!hasHeartbeat) this._syncingOnlineNodeInfo = false;
+                break;
+            }
+          }
         }
-      });
-
-      // Discover online nodes
-      if (addingNodes.length) {
-        const rawPackets = await this.client.hmgetBuffer(this.BEAT_KEY_HASH, ...addingNodes);
-        let packets = rawPackets.map((raw) => {
-          if (raw) return this.serializer.deserialize(raw, P.PACKET_INFO);
-        });
-        packets = packets.filter(packet => packet && (packet.sender !== this.broker.nodeID));
-        packets.forEach(packet => {
-          prevNodes.delete(packet.sender);
-        });
-
-        await this.bulkHeartbeatReceived(packets);
-      }
-
-      // Add offline nodes from registry to offline to track later
-      prevNodes.forEach(node => {
-        const key = `${this.PREFIX}-BEAT:${node.id}|${node.instanceID.substring(0, 8)}`;
-        if (!this._offlineNodes.has(key)) this._offlineNodes.set(key, 1);
-      });
-
-      // Removing offline nodes which are failed over threshold
-      const removingNodes = [];
-      this._offlineNodes.forEach((v, k) => {
-        if (v === this.opts.failThreshold) {
-          removingNodes.push(k);
-          // Clean one that already exceed the threshold
-          this._offlineNodes.delete(k);
-        }
-      });
-
-      if (removingNodes.length > 0) {
-        // Disconnected nodes
-        removingNodes.forEach(node => {
-          const p = node.substring(`${this.PREFIX}-BEAT:`.length).split('|');
-          const nodeID = p[0];
-          if (nodeID === this.broker.nodeID) return;
-
-          this.logger.info(
-            `The node '${nodeID}' is not available due to overing fail threshold (${this.opts.failThreshold}). Removing from registry...`
-          );
-          this.remoteNodeDisconnected(nodeID, true);
-        });
-      }
+      );
     } catch (error) {
-      this.logger.warn(`collectOnlineNodes has error`, error);
-    } finally {
       this._syncingOnlineNodeInfo = false;
+      this.logger.warn(`collectOnlineNodes has error`, error);
     }
   }
 
   async bulkHeartbeatReceived (packets) {
-    const chunkSize = 10;
-    const chunks = Array((Math.ceil(packets.length / chunkSize)))
-      .fill()
-      .map((_, index) => index * chunkSize)
-      .map(begin => packets.slice(begin, begin + chunkSize));
+    try {
+      const chunkSize = 10;
+      const chunks = Array((Math.ceil(packets.length / chunkSize)))
+        .fill()
+        .map((_, index) => index * chunkSize)
+        .map(begin => packets.slice(begin, begin + chunkSize));
 
-    for (let chunk of chunks) {
-      const newNodes = [];
-      const existingNodes = [];
-      chunk.forEach(packet => {
-        const node = this.registry.nodes.get(packet.sender);
-        if (node) {
-          existingNodes.push(packet);
-        } else {
-          newNodes.push(packet);
-        }
-      });
+      for (let chunk of chunks) {
+        const newNodes = [];
+        const existingNodes = [];
+        chunk.forEach(packet => {
+          const node = this.registry.nodes.get(packet.sender);
+          if (node) {
+            existingNodes.push(packet);
+          } else {
+            newNodes.push(packet);
+          }
+        });
 
-      const p1 = existingNodes.map(packet => this.heartbeatReceived(packet.sender, packet));
-      const p2 = this._addNewNodes(newNodes);
+        const p1 = existingNodes.map(packet => this.heartbeatReceived(packet.sender, packet));
+        const p2 = this._addNewNodes(newNodes);
 
-      await this.Promise.all(p1.concat(p2));
-      await this._delayWithRandom(2);
+        await this.Promise.all(p1.concat(p2));
+        await this._delayWithRandom(2);
+      }
+    } catch (error) {
+      this.logger.warn(`bulkHeartbeatReceived has error`, error);
+    } finally {
+      this._syncingOnlineNodeInfo = false;
     }
   }
 
@@ -488,42 +453,48 @@ class RedisDiscoverer extends BaseDiscoverer {
    *
    * @param {String} nodeID
    */
-  async discoverNode (nodeID, res = null) {
-    if (!res) {
-      res = await this.client.getBuffer(`${this.PREFIX}-INFO:${nodeID}`);
-      if (!res) {
-        this.logger.warn(`No INFO for '${nodeID}' node in registry.`);
-        return;
+  async discoverNode (nodeID) {
+    const self = this;
+    await this.pool.exec(
+      'discoverNode',
+      [nodeID, this.PREFIX],
+      {
+        on: (payload) => {
+          switch (payload.type) {
+            case 'processRemoteNodeInfo':
+              self.processRemoteNodeInfo(payload.payload.nodeID, payload.payload.info);
+              break;
+          }
+        }
       }
-    }
-
-    try {
-      const info = this.serializer.deserialize(res, P.PACKET_INFO);
-      return this.processRemoteNodeInfo(nodeID, info);
-    } catch (err) {
-      this.logger.warn('Unable to parse INFO packet', err);
-    }
+    );
   }
 
   /**
    * Discover all nodes (after connected)
    */
   async discoverAllNodes () {
-    this.logger.info(`discover all nodes`);
     return this.collectOnlineNodes();
   }
 
   async _addNewNodes (packets) {
-    const nodeIDs = packets.map(p => p.sender);
-    if (nodeIDs.length) {
-      const infos = await this.client.hmgetBuffer(this.INFO_KEY_HASH, ...nodeIDs);
-      for (let i = 0; i < infos.length; i++) {
-        const info = infos[i];
-        if (info) {
-          await this.discoverNode(nodeIDs[i], info);
+    const self = this;
+    await this.pool.exec(
+      'discoverNewNodes',
+      [
+        this.INFO_KEY_HASH,
+        packets
+      ],
+      {
+        on: (payload) => {
+          switch (payload.type) {
+            case 'nodeInfo':
+              self.processRemoteNodeInfo(payload.payload.nodeID, payload.payload.info);
+              break;
+          }
         }
       }
-    }
+    );
   }
 
   /**
